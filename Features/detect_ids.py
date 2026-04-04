@@ -1,130 +1,136 @@
-import pandas as pd
 import numpy as np
 import joblib
-from scapy.all import sniff, IP, TCP, ARP, Ether
+from scapy.all import sniff, IP, TCP, ARP
 import time
+import csv
+import os
 import warnings
-import csv  # Added for logging
-import os  # Added for logging
 
 warnings.filterwarnings("ignore")
 
-# ==================================================
-# CONFIGURATION
-# ==================================================
-INTERFACE = "VirtualBox Host-Only Ethernet Adapter"
-MODEL_PATH = "../Models/multiclass_ids_model.pkl"
-SCALER_PATH = "../Models/multiclass_ids_scaler.pkl"
-WINDOW_DURATION = 3
-LOG_FILE = "../Logs/ids_detection_logs.csv"
+# Configuration
+INTERFACE = "enp0s3"
+MODEL_PATH = "multiclass_ids_model.pkl"
+SCALER_PATH = "multiclass_ids_scaler.pkl"
+WINDOW_DURATION = 5
+LOG_FILE = "..\Logs\ids_detection_logs.csv"
 
-# Key: IP Address -> Value: Real MAC Address
 ip_mac_table = {}
+label_map = {0: "BENIGN", 1: "PortScan", 2: "DoS", 3: "SSH-Patator"}
 
-print("Loading AI Models...")
-try:
-    model = joblib.load(MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    label_map = {0: "BENIGN", 1: "PortScan", 2: "DoS", 3: "SSH-Patator"}
-    print("Models Loaded.")
-except Exception as e:
-    print(f"Error: {e}")
-    exit()
+# Load model and scaler
+model = joblib.load(MODEL_PATH)
+scaler = joblib.load(SCALER_PATH)
 
 
-# --- NEW: LOGGING FUNCTION ---
-def log_detection(ip, packets, status):
+def log_event(ip, packets, status, method):
     file_exists = os.path.isfile(LOG_FILE)
     with open(LOG_FILE, mode='a', newline='') as f:
         writer = csv.writer(f)
-        # Write the header only if the file is being created for the first time
         if not file_exists:
-            writer.writerow(["Timestamp", "Source_IP", "Packet_Count", "Detection_Status"])
+            writer.writerow(["Timestamp", "Source_IP", "Packets", "Status", "Detection_Method"])
+        writer.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), ip, packets, status, method])
 
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-        writer.writerow([timestamp, ip, packets, status])
+
+def fast_arp_check(p):
+    if p.haslayer(ARP) and p[ARP].op == 2:  # ARP Response
+        spa, sha = p[ARP].psrc, p[ARP].hwsrc
+        if spa in ip_mac_table and ip_mac_table[spa] != sha:
+            print(f"\n\033[41m[ALERT] ARP SPOOFING DETECTED: {spa} is at {sha}\033[0m\n")
+            log_event(spa, "N/A", "ARP_SPOOFING", "MAC_RULE")
+        ip_mac_table[spa] = sha
 
 
 def analyze_window(pkts):
     if not pkts:
         return
 
-    ip_stats = {}
+    stats = {}
 
     for p in pkts:
-        # --- 1) LAYER 2: ARP SPOOFING LOGIC ---
-        if p.haslayer(ARP):
-            if p[ARP].op == 2:
-                src_ip = p[ARP].psrc
-                src_mac = p[ARP].hwsrc
-
-                if src_ip in ip_mac_table and ip_mac_table[src_ip] != src_mac:
-                    alert_msg = "ARP SPOOFING DETECTED"
-                    print(f"\n[!] {alert_msg}!")
-                    print(f"    CONFLICT: {src_ip} is claimed by {src_mac}")
-                    log_detection(src_ip, "N/A", alert_msg)  # Log ARP Alert
-                else:
-                    ip_mac_table[src_ip] = src_mac
-
-        # --- 2) LAYER 4: AI DETECTION LOGIC ---
         if p.haslayer(IP):
             src = p[IP].src
-            if src == "127.0.0.1": continue
 
-            if src not in ip_stats:
-                ip_stats[src] = {
-                    'ports': set(), 'start': p.time, 'end': p.time,
-                    'pkts': 0, 'bytes': 0, 'syn': 0, 'ack': 0, 'rst': 0
+            # Filter management/local traffic
+            if src == "127.0.0.1" or src == "192.168.56.1":
+                continue
+
+            if src not in stats:
+                stats[src] = {
+                    'ports': [],
+                    'start': p.time,
+                    'end': p.time,
+                    'pkts': 0,
+                    'bytes': 0,
+                    'syn': 0,
+                    'ack': 0,
+                    'rst': 0
                 }
 
-            s = ip_stats[src]
+            s = stats[src]
             s['pkts'] += 1
             s['bytes'] += len(p)
             s['end'] = p.time
 
             if p.haslayer(TCP):
-                s['ports'].add(p[TCP].dport)
+                if p[TCP].dport not in s['ports']:
+                    s['ports'].append(p[TCP].dport)
                 flags = p[TCP].flags
                 if 'S' in flags: s['syn'] += 1
                 if 'A' in flags: s['ack'] += 1
                 if 'R' in flags: s['rst'] += 1
 
-    if ip_stats:
-        print(f"\n--- [ Analysis @ {time.strftime('%H:%M:%S')} ] ---")
-        for ip, data in ip_stats.items():
-            duration = float((data['end'] - data['start']) * 1e6) or 1.0
+    for ip, d in stats.items():
+        # Feature Engineering
+        duration = max((d['end'] - d['start']) * 1e6, 1)
+        avg_pkt_size = d['bytes'] / d['pkts'] if d['pkts'] else 0
+        dest_port = min(d['ports']) if d['ports'] else 0
+        fwd_pkts = d['pkts']
+        bwd_pkts = int(d['pkts'] * 0.3)
 
-            features = [
-                list(data['ports'])[0] if data['ports'] else 0,
-                duration, data['pkts'], 0, data['bytes'] / data['pkts'],
-                data['syn'], data['ack'], data['rst'],
-                                           (data['bytes'] / duration) * 1e6, (data['pkts'] / duration) * 1e6
-            ]
+        features = [
+            dest_port, duration, fwd_pkts, bwd_pkts, avg_pkt_size,
+            d['syn'], d['ack'], d['rst'],
+            (d['bytes'] / duration) * 1e6, (d['pkts'] / duration) * 1e6
+        ]
 
-            X = scaler.transform([features])
-            pred = model.predict(X)[0]
-            status = label_map[pred]
+        # ML Prediction
+        X = scaler.transform([features])
+        probs = model.predict_proba(X)[0]
 
-            # Heuristics for demo stability
-            u_ports = len(data['ports'])
-            if u_ports > 15:
-                status = "PortScan"
-            elif data['pkts'] > 100 and u_ports < 5:
-                status = "DoS"
-            elif data['pkts'] > 15 and 22 in data['ports']:
-                status = "SSH-Patator"
+        # Hybrid Decision Logic
+        u_ports = len(set(d['ports']))
+        method = "AI"
 
-            print(f"IP: {ip:<15} | Packets: {data['pkts']:<5} | Status: {status}")
+        if u_ports > 10:
+            status = "PortScan"
+            method = "Heuristic"
+        elif d['pkts'] > 1000:
+            status = "DoS"
+            method = "Heuristic"
+        elif probs[3] > 0.2:
+            status = "SSH-Patator"
+        elif probs[2] > 0.2:
+            status = "DoS"
+        else:
+            status = "BENIGN"
 
-            # --- LOG THE DETECTION TO CSV ---
-            log_detection(ip, data['pkts'], status)
+        # --- KEY FIX: Log everything to the CSV here ---
+        log_event(ip, d['pkts'], status, method)
+
+        # UI Feedback
+        if status == "BENIGN":
+            print(f"[OK] {ip} Normal")
+        else:
+            print(f"\033[91m[ALERT] {ip} -> {status} ({method})\033[0m")
 
 
-print(f"HYBRID IDS STARTING ON {INTERFACE}...")
+print(f"IDS running on {INTERFACE}... (Management Traffic Filtered)")
+
 while True:
     try:
-        sniffed_packets = sniff(iface=INTERFACE, timeout=WINDOW_DURATION)
-        analyze_window(sniffed_packets)
+        sniffed = sniff(iface=INTERFACE, timeout=WINDOW_DURATION, prn=fast_arp_check)
+        analyze_window(sniffed)
     except KeyboardInterrupt:
         print("\nStopping IDS...")
         break
